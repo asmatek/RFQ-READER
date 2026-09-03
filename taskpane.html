@@ -400,7 +400,7 @@ async function callGemini(apiKey, text, images) {
     parts.push({ inline_data: { mime_type: img.mediaType, data: img.base64 } });
   });
 
-  const model = 'gemini-2.5-flash'; // free-tier eligible; change here if you want a newer Flash model
+  const model = 'gemini-3.6-flash'; // free-tier eligible; change here if Google renames/deprecates this again
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
   const response = await fetch(url, {
