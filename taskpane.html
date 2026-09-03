@@ -12,7 +12,7 @@
   body { font-family: Segoe UI, Arial, sans-serif; margin: 0; padding: 12px; font-size: 13px; color: #222; }
   h2 { font-size: 16px; margin: 0 0 8px; }
   .row { margin-bottom: 10px; }
-  input[type=password], input[type=text] { width: 100%; box-sizing: border-box; padding: 6px; }
+  input[type=password], input[type=text], select { width: 100%; box-sizing: border-box; padding: 6px; }
   button { background: #005a9e; color: #fff; border: none; padding: 8px 14px; border-radius: 3px; cursor: pointer; margin-right: 6px; }
   button:disabled { background: #999; cursor: not-allowed; }
   button.secondary { background: #eee; color: #222; }
@@ -21,19 +21,29 @@
   th, td { border: 1px solid #ccc; padding: 4px 6px; text-align: left; vertical-align: top; }
   th { background: #f0f0f0; position: sticky; top: 0; }
   .wrap { max-height: 380px; overflow: auto; border: 1px solid #ddd; }
-  details { margin-top: 8px; }
-  .hint { color: #777; font-size: 11px; }
+  details { margin-top: 8px; margin-bottom: 8px; }
+  .hint { color: #777; font-size: 11px; margin-top: 3px; }
+  label { font-weight: 600; display: block; margin-bottom: 3px; }
   canvas { display: none; }
 </style>
 </head>
 <body>
   <h2>RFQ Reader</h2>
 
-  <details>
-    <summary>Anthropic API key (stored locally on this device)</summary>
+  <details open>
+    <summary>AI provider &amp; API key</summary>
     <div class="row" style="margin-top:8px;">
-      <input type="password" id="apiKey" placeholder="sk-ant-..." />
-      <div class="hint">Needed to translate &amp; extract the RFQ data. Get one at console.anthropic.com. Sent only to api.anthropic.com directly from your machine.</div>
+      <label>Provider</label>
+      <select id="provider">
+        <option value="gemini">Google Gemini (free tier)</option>
+        <option value="claude">Anthropic Claude (paid)</option>
+      </select>
+      <div class="hint" id="providerHint"></div>
+    </div>
+    <div class="row">
+      <label id="apiKeyLabel">API key</label>
+      <input type="password" id="apiKey" placeholder="paste key here" />
+      <div class="hint" id="apiKeyHint"></div>
     </div>
   </details>
 
@@ -68,12 +78,47 @@
   <canvas id="renderCanvas"></canvas>
 
 <script>
+const PROVIDER_INFO = {
+  gemini: {
+    label: 'Google AI Studio (Gemini) key',
+    hint: 'Free, no credit card needed. Get one at aistudio.google.com/apikey.',
+    settingKey: 'geminiApiKey',
+    providerHint: 'Free tier (rate-limited, fine for occasional use). Google may use free-tier requests to improve their models.'
+  },
+  claude: {
+    label: 'Anthropic API key',
+    hint: 'Requires a funded Anthropic Console account (console.anthropic.com → Plans & Billing).',
+    settingKey: 'anthropicApiKey',
+    providerHint: 'Paid, pay-as-you-go. Your data is not used for training.'
+  }
+};
+
+function refreshProviderUI() {
+  const provider = document.getElementById('provider').value;
+  const info = PROVIDER_INFO[provider];
+  document.getElementById('apiKeyLabel').textContent = info.label;
+  document.getElementById('apiKeyHint').textContent = info.hint;
+  document.getElementById('providerHint').textContent = info.providerHint;
+  document.getElementById('apiKey').value = Office.context.roamingSettings.get(info.settingKey) || '';
+}
+
 Office.onReady(() => {
-  document.getElementById('apiKey').value = Office.context.roamingSettings.get('anthropicApiKey') || '';
+  const savedProvider = Office.context.roamingSettings.get('provider') || 'gemini';
+  document.getElementById('provider').value = savedProvider;
+  refreshProviderUI();
+
+  document.getElementById('provider').addEventListener('change', (e) => {
+    Office.context.roamingSettings.set('provider', e.target.value);
+    Office.context.roamingSettings.saveAsync();
+    refreshProviderUI();
+  });
+
   document.getElementById('apiKey').addEventListener('change', (e) => {
-    Office.context.roamingSettings.set('anthropicApiKey', e.target.value);
+    const provider = document.getElementById('provider').value;
+    Office.context.roamingSettings.set(PROVIDER_INFO[provider].settingKey, e.target.value);
     Office.context.roamingSettings.saveAsync();
   });
+
   document.getElementById('runBtn').addEventListener('click', runExtraction);
   document.getElementById('downloadBtn').addEventListener('click', downloadExcel);
 });
@@ -155,10 +200,8 @@ async function extractPdf(bytes, label, images) {
     const content = await page.getTextContent();
     const pageText = content.items.map(it => it.str).join(' ');
     text += pageText + '\n';
-    // Heuristic: very little embedded text -> likely a scanned drawing/nameplate photo.
     if (pageText.trim().length < 40) pagesToMaybeRender.push(p);
   }
-  // Render a handful of sparse-text pages as images so the model can read them visually.
   for (const p of pagesToMaybeRender.slice(0, 5)) {
     if (images.length >= MAX_IMAGES) break;
     try {
@@ -289,7 +332,7 @@ async function gatherAllContent() {
   return { text: combinedText, images };
 }
 
-// ---------- Step 2: send to Claude for translation + structured extraction ----------
+// ---------- Step 2: send to the chosen AI provider ----------
 
 const SYSTEM_PROMPT = `You extract structured data from procurement / RFQ / tender documents (often in Russian or Kazakh) and translate everything into clear English.
 
@@ -307,8 +350,13 @@ Return a JSON array. Each element represents one lot/line item and must have exa
 
 If the document covers multiple lots, return one row per lot. If there is only one lot/item, return a single-element array. Respond with ONLY the JSON array, no markdown fences, no commentary.`;
 
+function parseJsonArrayFromText(raw) {
+  const cleaned = raw.replace(/```json|```/g, '').trim();
+  return JSON.parse(cleaned);
+}
+
 async function callClaude(apiKey, text, images) {
-  const maxChars = 180000; // keep well within context; trim if huge
+  const maxChars = 180000;
   const trimmed = text.length > maxChars ? text.slice(0, maxChars) : text;
 
   const content = [{ type: 'text', text: trimmed }];
@@ -337,11 +385,46 @@ async function callClaude(apiKey, text, images) {
     const errText = await response.text();
     throw new Error(`Anthropic API error ${response.status}: ${errText}`);
   }
-
   const data = await response.json();
   const textBlocks = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
-  const cleaned = textBlocks.replace(/```json|```/g, '').trim();
-  return JSON.parse(cleaned);
+  return parseJsonArrayFromText(textBlocks);
+}
+
+async function callGemini(apiKey, text, images) {
+  const maxChars = 180000;
+  const trimmed = text.length > maxChars ? text.slice(0, maxChars) : text;
+
+  const parts = [{ text: trimmed }];
+  images.slice(0, MAX_IMAGES).forEach(img => {
+    parts.push({ text: `Image: ${img.name}` });
+    parts.push({ inline_data: { mime_type: img.mediaType, data: img.base64 } });
+  });
+
+  const model = 'gemini-2.5-flash'; // free-tier eligible; change here if you want a newer Flash model
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+    body: JSON.stringify({
+      system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [{ role: 'user', parts }]
+    })
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Gemini API error ${response.status}: ${errText}`);
+  }
+  const data = await response.json();
+  const candidate = (data.candidates || [])[0];
+  const textOut = ((candidate && candidate.content && candidate.content.parts) || [])
+    .map(p => p.text || '').join('\n');
+  return parseJsonArrayFromText(textOut);
+}
+
+async function callProvider(provider, apiKey, text, images) {
+  return provider === 'gemini' ? callGemini(apiKey, text, images) : callClaude(apiKey, text, images);
 }
 
 // ---------- Step 3: render + export ----------
@@ -389,16 +472,17 @@ function downloadExcel() {
 }
 
 async function runExtraction() {
+  const provider = document.getElementById('provider').value;
   const apiKey = document.getElementById('apiKey').value.trim();
   if (!apiKey) {
-    setStatus('Please enter your Anthropic API key first.');
+    setStatus(`Please enter your ${PROVIDER_INFO[provider].label} first.`);
     return;
   }
   document.getElementById('runBtn').disabled = true;
   try {
     const { text, images } = await gatherAllContent();
-    setStatus(`Translating & extracting RFQ data with Claude (${images.length} image(s) included)...`);
-    const rows = await callClaude(apiKey, text, images);
+    setStatus(`Translating & extracting RFQ data with ${provider === 'gemini' ? 'Gemini' : 'Claude'} (${images.length} image(s) included)...`);
+    const rows = await callProvider(provider, apiKey, text, images);
     lastRows = Array.isArray(rows) ? rows : [];
     renderTable(lastRows);
     setStatus(`Done. Extracted ${lastRows.length} row(s).`);
