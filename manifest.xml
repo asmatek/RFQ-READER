@@ -12,12 +12,12 @@
   <DefaultLocale>en-US</DefaultLocale>
   <DisplayName DefaultValue="RFQ Reader" />
   <Description DefaultValue="Extracts, translates, and tabulates RFQ/tender data from the email body and attachments (PDF/ZIP), then exports to Excel." />
-  <IconUrl DefaultValue="https://YOUR_HOSTING_DOMAIN/assets/icon-64.png" />
-  <HighResIconUrl DefaultValue="https://YOUR_HOSTING_DOMAIN/assets/icon-80.png" />
-  <SupportUrl DefaultValue="https://YOUR_HOSTING_DOMAIN/" />
+  <IconUrl DefaultValue="https://asmatek.github.io/RFQ-READER/assets/icon-64.png" />
+  <HighResIconUrl DefaultValue="https://asmatek.github.io/RFQ-READER/assets/icon-80.png" />
+  <SupportUrl DefaultValue="https://asmatek.github.io/RFQ-READER/" />
 
   <AppDomains>
-    <AppDomain>https://YOUR_HOSTING_DOMAIN</AppDomain>
+    <AppDomain>https://asmatek.github.io/RFQ-READER</AppDomain>
     <AppDomain>https://api.anthropic.com</AppDomain>
   </AppDomains>
 
@@ -34,7 +34,7 @@
   <FormSettings>
     <Form xsi:type="ItemRead">
       <DesktopSettings>
-        <SourceLocation DefaultValue="https://YOUR_HOSTING_DOMAIN/taskpane.html" />
+        <SourceLocation DefaultValue="https://asmatek.github.io/RFQ-READER/taskpane.html" />
         <RequestedHeight>450</RequestedHeight>
       </DesktopSettings>
     </Form>
@@ -90,13 +90,13 @@
     </Hosts>
     <Resources>
       <bt:Images>
-        <bt:Image id="Icon.16x16" DefaultValue="https://YOUR_HOSTING_DOMAIN/assets/icon-32.png" />
-        <bt:Image id="Icon.32x32" DefaultValue="https://YOUR_HOSTING_DOMAIN/assets/icon-32.png" />
-        <bt:Image id="Icon.80x80" DefaultValue="https://YOUR_HOSTING_DOMAIN/assets/icon-80.png" />
+        <bt:Image id="Icon.16x16" DefaultValue="https://asmatek.github.io/RFQ-READER/assets/icon-32.png" />
+        <bt:Image id="Icon.32x32" DefaultValue="https://asmatek.github.io/RFQ-READER/assets/icon-32.png" />
+        <bt:Image id="Icon.80x80" DefaultValue="https://asmatek.github.io/RFQ-READER/assets/icon-80.png" />
       </bt:Images>
       <bt:Urls>
-        <bt:Url id="Commands.Url" DefaultValue="https://YOUR_HOSTING_DOMAIN/taskpane.html" />
-        <bt:Url id="Taskpane.Url" DefaultValue="https://YOUR_HOSTING_DOMAIN/taskpane.html" />
+        <bt:Url id="Commands.Url" DefaultValue="https://asmatek.github.io/RFQ-READER/taskpane.html" />
+        <bt:Url id="Taskpane.Url" DefaultValue="https://asmatek.github.io/RFQ-READER/taskpane.html" />
       </bt:Urls>
       <bt:ShortStrings>
         <bt:String id="GroupLabel" DefaultValue="RFQ Reader" />
