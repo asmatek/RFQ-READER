@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>RFQ Reader</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+<style>
+  body { font-family: Segoe UI, Arial, sans-serif; margin: 0; padding: 12px; font-size: 13px; color: #222; }
+  h2 { font-size: 16px; margin: 0 0 8px; }
+  .row { margin-bottom: 10px; }
+  input[type=password], input[type=text] { width: 100%; box-sizing: border-box; padding: 6px; }
+  button { background: #005a9e; color: #fff; border: none; padding: 8px 14px; border-radius: 3px; cursor: pointer; margin-right: 6px; }
+  button:disabled { background: #999; cursor: not-allowed; }
+  button.secondary { background: #eee; color: #222; }
+  #status { margin: 10px 0; font-style: italic; color: #555; white-space: pre-wrap; }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; font-size: 12px; }
+  th, td { border: 1px solid #ccc; padding: 4px 6px; text-align: left; vertical-align: top; }
+  th { background: #f0f0f0; position: sticky; top: 0; }
+  .wrap { max-height: 380px; overflow: auto; border: 1px solid #ddd; }
+  details { margin-top: 8px; }
+  .hint { color: #777; font-size: 11px; }
+  canvas { display: none; }
+</style>
+</head>
+<body>
+  <h2>RFQ Reader</h2>
+
+  <details>
+    <summary>Anthropic API key (stored locally on this device)</summary>
+    <div class="row" style="margin-top:8px;">
+      <input type="password" id="apiKey" placeholder="sk-ant-..." />
+      <div class="hint">Needed to translate &amp; extract the RFQ data. Get one at console.anthropic.com. Sent only to api.anthropic.com directly from your machine.</div>
+    </div>
+  </details>
+
+  <div class="row">
+    <button id="runBtn">Read this email &amp; extract RFQ table</button>
+  </div>
+
+  <div id="status"></div>
+
+  <div class="row" id="downloadRow" style="display:none;">
+    <button id="downloadBtn" class="secondary">Download Excel (.xlsx)</button>
+  </div>
+
+  <div class="wrap">
+    <table id="resultTable" style="display:none;">
+      <thead>
+        <tr>
+          <th>Lot #</th>
+          <th>Description</th>
+          <th>Part Number</th>
+          <th>Quantity</th>
+          <th>Budget</th>
+          <th>Manufacturer</th>
+          <th>Additional Info</th>
+          <th>Tender End Date</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <canvas id="renderCanvas"></canvas>
+
+<script>
+Office.onReady(() => {
+  document.getElementById('apiKey').value = Office.context.roamingSettings.get('anthropicApiKey') || '';
+  document.getElementById('apiKey').addEventListener('change', (e) => {
+    Office.context.roamingSettings.set('anthropicApiKey', e.target.value);
+    Office.context.roamingSettings.saveAsync();
+  });
+  document.getElementById('runBtn').addEventListener('click', runExtraction);
+  document.getElementById('downloadBtn').addEventListener('click', downloadExcel);
+});
+
+let lastRows = [];
+const MAX_IMAGES = 15;          // cap total images sent to the model
+const MAX_IMAGE_DIM = 1600;     // downscale large images/renders to this max side length
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+// ---------- helpers ----------
+
+function base64ToBytes(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function fileExt(name) {
+  const m = /\.([a-z0-9]+)$/i.exec(name || '');
+  return m ? m[1].toLowerCase() : '';
+}
+
+function guessImageMime(ext) {
+  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+  if (ext === 'png') return 'image/png';
+  if (ext === 'gif') return 'image/gif';
+  if (ext === 'bmp') return 'image/bmp';
+  if (ext === 'webp') return 'image/webp';
+  return 'image/png';
+}
+
+// Downscale + re-encode an image (base64 in, base64 PNG/JPEG out) to keep payloads small.
+function downscaleImage(base64, mime) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      let { width, height } = img;
+      const scale = Math.min(1, MAX_IMAGE_DIM / Math.max(width, height));
+      width = Math.round(width * scale);
+      height = Math.round(height * scale);
+      const canvas = document.getElementById('renderCanvas');
+      canvas.width = width; canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+      const outMime = mime === 'image/png' ? 'image/png' : 'image/jpeg';
+      const dataUrl = canvas.toDataURL(outMime, 0.85);
+      resolve({ base64: dataUrl.split(',')[1], mediaType: outMime });
+    };
+    img.onerror = () => resolve({ base64, mediaType: mime }); // fall back to original
+    img.src = `data:${mime};base64,${base64}`;
+  });
+}
+
+async function renderPdfPageToImage(page) {
+  const viewport = page.getViewport({ scale: 1.5 });
+  const canvas = document.getElementById('renderCanvas');
+  canvas.width = Math.min(viewport.width, MAX_IMAGE_DIM);
+  const scaleFactor = canvas.width / viewport.width;
+  canvas.height = viewport.height * scaleFactor;
+  const ctx = canvas.getContext('2d');
+  await page.render({ canvasContext: ctx, viewport: page.getViewport({ scale: 1.5 * scaleFactor }) }).promise;
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+  return dataUrl.split(',')[1];
+}
+
+// ---------- extraction per file type ----------
+
+async function extractPdf(bytes, label, images) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  const doc = await pdfjsLib.getDocument({ data: bytes }).promise;
+  let text = '';
+  const pagesToMaybeRender = [];
+  for (let p = 1; p <= doc.numPages; p++) {
+    const page = await doc.getPage(p);
+    const content = await page.getTextContent();
+    const pageText = content.items.map(it => it.str).join(' ');
+    text += pageText + '\n';
+    // Heuristic: very little embedded text -> likely a scanned drawing/nameplate photo.
+    if (pageText.trim().length < 40) pagesToMaybeRender.push(p);
+  }
+  // Render a handful of sparse-text pages as images so the model can read them visually.
+  for (const p of pagesToMaybeRender.slice(0, 5)) {
+    if (images.length >= MAX_IMAGES) break;
+    try {
+      const page = await doc.getPage(p);
+      const b64 = await renderPdfPageToImage(page);
+      images.push({ name: `${label} (page ${p}, rendered)`, base64: b64, mediaType: 'image/jpeg' });
+    } catch (e) { /* ignore render failures */ }
+  }
+  return text;
+}
+
+async function extractDocx(bytes) {
+  const result = await mammoth.extractRawText({ arrayBuffer: bytes.buffer });
+  return result.value || '';
+}
+
+async function extractSpreadsheet(bytes) {
+  const wb = XLSX.read(bytes, { type: 'array' });
+  let text = '';
+  wb.SheetNames.forEach(name => {
+    const csv = XLSX.utils.sheet_to_csv(wb.Sheets[name]);
+    text += `\n--- Sheet: ${name} ---\n` + csv + '\n';
+  });
+  return text;
+}
+
+async function processZip(base64, images) {
+  const zip = await JSZip.loadAsync(base64, { base64: true });
+  let combined = '';
+  for (const name of Object.keys(zip.files)) {
+    const file = zip.files[name];
+    if (file.dir) continue;
+    const ext = fileExt(name);
+    try {
+      if (ext === 'pdf') {
+        const b64 = await file.async('base64');
+        const t = await extractPdf(base64ToBytes(b64), name, images);
+        combined += `\n--- ${name} ---\n` + t;
+      } else if (ext === 'docx') {
+        const buf = await file.async('arraybuffer');
+        const t = await extractDocx(new Uint8Array(buf));
+        combined += `\n--- ${name} ---\n` + t;
+      } else if (ext === 'xlsx' || ext === 'xls' || ext === 'csv') {
+        const buf = await file.async('arraybuffer');
+        const t = await extractSpreadsheet(new Uint8Array(buf));
+        combined += `\n--- ${name} ---\n` + t;
+      } else if (['jpg','jpeg','png','gif','bmp','webp'].includes(ext)) {
+        if (images.length < MAX_IMAGES) {
+          const b64 = await file.async('base64');
+          const scaled = await downscaleImage(b64, guessImageMime(ext));
+          images.push({ name, base64: scaled.base64, mediaType: scaled.mediaType });
+        }
+      } else if (ext === 'dwg' || ext === 'dxf') {
+        combined += `\n--- ${name} (CAD file - not readable in-browser; export as PDF/image to include) ---\n`;
+      }
+    } catch (e) {
+      combined += `\n--- ${name} (could not be parsed: ${e}) ---\n`;
+    }
+  }
+  return combined;
+}
+
+// ---------- Step 1: gather text + images from the email body + attachments ----------
+
+function getBodyText() {
+  return new Promise((resolve, reject) => {
+    Office.context.mailbox.item.body.getAsync(Office.CoercionType.Text, (result) => {
+      if (result.status === Office.AsyncResultStatus.Succeeded) resolve(result.value);
+      else reject(result.error);
+    });
+  });
+}
+
+function getAttachmentContent(attachmentId) {
+  return new Promise((resolve, reject) => {
+    Office.context.mailbox.item.getAttachmentContentAsync(attachmentId, (result) => {
+      if (result.status === Office.AsyncResultStatus.Succeeded) resolve(result.value);
+      else reject(result.error);
+    });
+  });
+}
+
+async function gatherAllContent() {
+  let combinedText = '';
+  const images = [];
+
+  setStatus('Reading email body...');
+  const body = await getBodyText();
+  combinedText += '=== EMAIL BODY ===\n' + body + '\n\n';
+
+  const attachments = Office.context.mailbox.item.attachments || [];
+  for (const att of attachments) {
+    setStatus(`Reading attachment: ${att.name} ...`);
+    const ext = fileExt(att.name);
+    try {
+      const content = await getAttachmentContent(att.id);
+      if (content.format !== Office.MailboxEnums.AttachmentContentFormat.Base64) continue;
+
+      if (ext === 'pdf') {
+        const t = await extractPdf(base64ToBytes(content.content), att.name, images);
+        combinedText += `=== ATTACHMENT: ${att.name} ===\n` + t + '\n\n';
+      } else if (ext === 'zip') {
+        const t = await processZip(content.content, images);
+        combinedText += `=== ATTACHMENT (ZIP): ${att.name} ===\n` + t + '\n\n';
+      } else if (ext === 'docx') {
+        const t = await extractDocx(base64ToBytes(content.content));
+        combinedText += `=== ATTACHMENT: ${att.name} ===\n` + t + '\n\n';
+      } else if (ext === 'doc') {
+        combinedText += `=== ATTACHMENT: ${att.name} (legacy .doc not supported - please resend as .docx or PDF) ===\n\n`;
+      } else if (ext === 'xlsx' || ext === 'xls' || ext === 'csv') {
+        const t = await extractSpreadsheet(base64ToBytes(content.content));
+        combinedText += `=== ATTACHMENT: ${att.name} ===\n` + t + '\n\n';
+      } else if (['jpg','jpeg','png','gif','bmp','webp'].includes(ext)) {
+        if (images.length < MAX_IMAGES) {
+          const mime = att.contentType && att.contentType.startsWith('image/') ? att.contentType : guessImageMime(ext);
+          const scaled = await downscaleImage(content.content, mime);
+          images.push({ name: att.name, base64: scaled.base64, mediaType: scaled.mediaType });
+        }
+      } else if (ext === 'dwg' || ext === 'dxf') {
+        combinedText += `=== ATTACHMENT: ${att.name} (CAD drawing file - not readable in-browser; please export/attach as PDF or image so it can be read) ===\n\n`;
+      } else {
+        combinedText += `=== ATTACHMENT: ${att.name} (skipped, unsupported type) ===\n\n`;
+      }
+    } catch (e) {
+      combinedText += `=== ATTACHMENT: ${att.name} (error reading: ${e}) ===\n\n`;
+    }
+  }
+  return { text: combinedText, images };
+}
+
+// ---------- Step 2: send to Claude for translation + structured extraction ----------
+
+const SYSTEM_PROMPT = `You extract structured data from procurement / RFQ / tender documents (often in Russian or Kazakh) and translate everything into clear English.
+
+You may receive: email text, extracted text from PDF/Word/Excel documents, and images (photographs of equipment nameplates, scanned pages, or technical drawings). Read any text visible in the images too (part numbers, model/serial numbers, manufacturer names, ratings) and use it to fill in or corroborate the fields below.
+
+Return a JSON array. Each element represents one lot/line item and must have exactly these fields:
+- "lot_number": the lot or line number (and purchase/tender number if shown alongside it)
+- "description": a concise English description of the item/goods/works/services (translate from Russian/Kazakh)
+- "part_number": manufacturer part number / drawing number if present, else ""
+- "quantity": quantity and unit (e.g. "5 pcs"), else ""
+- "budget": the budgeted/planned amount and currency for that lot, else ""
+- "manufacturer": manufacturer/brand/model if mentioned, else ""
+- "additional_info": delivery location, payment terms, delivery timeframe, or any other notable requirement, in English, else ""
+- "tender_end_date": the deadline for submitting bids/quotes (date and time if available), else ""
+
+If the document covers multiple lots, return one row per lot. If there is only one lot/item, return a single-element array. Respond with ONLY the JSON array, no markdown fences, no commentary.`;
+
+async function callClaude(apiKey, text, images) {
+  const maxChars = 180000; // keep well within context; trim if huge
+  const trimmed = text.length > maxChars ? text.slice(0, maxChars) : text;
+
+  const content = [{ type: 'text', text: trimmed }];
+  images.slice(0, MAX_IMAGES).forEach(img => {
+    content.push({ type: 'text', text: `Image: ${img.name}` });
+    content.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.base64 } });
+  });
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 4096,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: 'user', content }]
+    })
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Anthropic API error ${response.status}: ${errText}`);
+  }
+
+  const data = await response.json();
+  const textBlocks = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+  const cleaned = textBlocks.replace(/```json|```/g, '').trim();
+  return JSON.parse(cleaned);
+}
+
+// ---------- Step 3: render + export ----------
+
+function renderTable(rows) {
+  const tbody = document.querySelector('#resultTable tbody');
+  tbody.innerHTML = '';
+  const fields = ['lot_number','description','part_number','quantity','budget','manufacturer','additional_info','tender_end_date'];
+  rows.forEach(r => {
+    const tr = document.createElement('tr');
+    fields.forEach(f => {
+      const td = document.createElement('td');
+      td.textContent = r[f] || '';
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  document.getElementById('resultTable').style.display = rows.length ? 'table' : 'none';
+  document.getElementById('downloadRow').style.display = rows.length ? 'block' : 'none';
+}
+
+function downloadExcel() {
+  if (!lastRows.length) return;
+  const headerMap = {
+    lot_number: 'Lot Number',
+    description: 'Description',
+    part_number: 'Part Number',
+    quantity: 'Quantity',
+    budget: 'Budget',
+    manufacturer: 'Manufacturer',
+    additional_info: 'Additional Info',
+    tender_end_date: 'Tender End Date'
+  };
+  const mapped = lastRows.map(r => {
+    const o = {};
+    Object.keys(headerMap).forEach(k => { o[headerMap[k]] = r[k] || ''; });
+    return o;
+  });
+  const ws = XLSX.utils.json_to_sheet(mapped);
+  ws['!cols'] = [{wch:12},{wch:50},{wch:20},{wch:12},{wch:16},{wch:18},{wch:40},{wch:18}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'RFQ');
+  const subjectSafe = (Office.context.mailbox.item.subject || 'RFQ').replace(/[^a-z0-9]+/gi, '_').slice(0, 40);
+  XLSX.writeFile(wb, `RFQ_${subjectSafe}.xlsx`);
+}
+
+async function runExtraction() {
+  const apiKey = document.getElementById('apiKey').value.trim();
+  if (!apiKey) {
+    setStatus('Please enter your Anthropic API key first.');
+    return;
+  }
+  document.getElementById('runBtn').disabled = true;
+  try {
+    const { text, images } = await gatherAllContent();
+    setStatus(`Translating & extracting RFQ data with Claude (${images.length} image(s) included)...`);
+    const rows = await callClaude(apiKey, text, images);
+    lastRows = Array.isArray(rows) ? rows : [];
+    renderTable(lastRows);
+    setStatus(`Done. Extracted ${lastRows.length} row(s).`);
+  } catch (e) {
+    setStatus('Error: ' + (e.message || e));
+    console.error(e);
+  } finally {
+    document.getElementById('runBtn').disabled = false;
+  }
+}
+</script>
+</body>
+</html>
