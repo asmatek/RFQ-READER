@@ -412,6 +412,26 @@ async function callGeminiOnce(apiKey, model, systemPrompt, parts) {
     .map(p => p.text || '').join('\n');
 }
 
+async function listGeminiFlashModels(apiKey) {
+  const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+    headers: { 'x-goog-api-key': apiKey }
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Gemini ListModels error ${res.status}: ${errText}`);
+  }
+  const data = await res.json();
+  const models = (data.models || [])
+    .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map(m => m.name.replace(/^models\//, ''))
+    .filter(n => /flash/i.test(n) && !/vision|embedding|tts|image-gen/i.test(n));
+
+  // Prefer non-"lite" flash models first (a bit stronger), then lite variants as fallback.
+  const full = models.filter(n => !/lite/i.test(n));
+  const lite = models.filter(n => /lite/i.test(n));
+  return [...full, ...lite];
+}
+
 async function callGemini(apiKey, text, images) {
   const maxChars = 180000;
   const trimmed = text.length > maxChars ? text.slice(0, maxChars) : text;
@@ -422,33 +442,45 @@ async function callGemini(apiKey, text, images) {
     parts.push({ inline_data: { mime_type: img.mediaType, data: img.base64 } });
   });
 
-  // Try the primary model with a few retries (Google's free tier can be
-  // overloaded at peak times), then fall back to the Lite model, which is
-  // usually less contended.
-  const attempts = [
-    { model: 'gemini-3.6-flash', delayMs: 0 },
-    { model: 'gemini-3.6-flash', delayMs: 4000 },
-    { model: 'gemini-3.6-flash', delayMs: 9000 },
-    { model: 'gemini-3.6-flash-lite', delayMs: 0 },
-    { model: 'gemini-3.6-flash-lite', delayMs: 5000 }
-  ];
+  setStatus('Checking which Gemini models are currently available...');
+  let candidateModels;
+  try {
+    candidateModels = await listGeminiFlashModels(apiKey);
+  } catch (e) {
+    // If listing itself fails (e.g. bad key), surface that immediately.
+    throw e;
+  }
+  if (!candidateModels.length) {
+    throw new Error('No usable Gemini Flash models were returned for this API key/account.');
+  }
+
+  // Build an attempt plan: try each candidate model once immediately, then
+  // retry the first couple with backoff if they're just overloaded (503/429).
+  const attempts = [];
+  candidateModels.slice(0, 4).forEach((model, idx) => {
+    attempts.push({ model, delayMs: 0 });
+  });
+  // extra retries with backoff for the top pick, appended after the first pass
+  attempts.push({ model: candidateModels[0], delayMs: 5000 });
+  attempts.push({ model: candidateModels[0], delayMs: 9000 });
 
   let lastErr;
   for (let i = 0; i < attempts.length; i++) {
     const { model, delayMs } = attempts[i];
     if (delayMs) {
-      setStatus(`Gemini (${model}) is busy — retrying in ${Math.round(delayMs / 1000)}s (attempt ${i + 1}/${attempts.length})...`);
+      setStatus(`Gemini is busy — retrying "${model}" in ${Math.round(delayMs / 1000)}s (attempt ${i + 1}/${attempts.length})...`);
       await new Promise(r => setTimeout(r, delayMs));
-    } else if (i > 0) {
-      setStatus(`Retrying with ${model} (attempt ${i + 1}/${attempts.length})...`);
+    } else {
+      setStatus(`Trying model "${model}" (attempt ${i + 1}/${attempts.length})...`);
     }
     try {
       const textOut = await callGeminiOnce(apiKey, model, SYSTEM_PROMPT, parts);
       return parseJsonArrayFromText(textOut);
     } catch (e) {
       lastErr = e;
-      // Only keep retrying on overload/rate-limit style errors; fail fast on anything else (e.g. bad key).
-      if (![429, 503, 500].includes(e.status)) throw e;
+      // 404 = this particular model isn't usable for this key; move to the next candidate.
+      // 429/503/500 = overloaded/rate-limited; also worth trying the next one.
+      if (![404, 429, 503, 500].includes(e.status)) throw e;
     }
   }
   throw lastErr;
