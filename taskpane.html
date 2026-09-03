@@ -390,6 +390,28 @@ async function callClaude(apiKey, text, images) {
   return parseJsonArrayFromText(textBlocks);
 }
 
+async function callGeminiOnce(apiKey, model, systemPrompt, parts) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+    body: JSON.stringify({
+      system_instruction: { parts: [{ text: systemPrompt }] },
+      contents: [{ role: 'user', parts }]
+    })
+  });
+  if (!response.ok) {
+    const errText = await response.text();
+    const err = new Error(`Gemini API error ${response.status}: ${errText}`);
+    err.status = response.status;
+    throw err;
+  }
+  const data = await response.json();
+  const candidate = (data.candidates || [])[0];
+  return ((candidate && candidate.content && candidate.content.parts) || [])
+    .map(p => p.text || '').join('\n');
+}
+
 async function callGemini(apiKey, text, images) {
   const maxChars = 180000;
   const trimmed = text.length > maxChars ? text.slice(0, maxChars) : text;
@@ -400,27 +422,36 @@ async function callGemini(apiKey, text, images) {
     parts.push({ inline_data: { mime_type: img.mediaType, data: img.base64 } });
   });
 
-  const model = 'gemini-3.6-flash'; // free-tier eligible; change here if Google renames/deprecates this again
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  // Try the primary model with a few retries (Google's free tier can be
+  // overloaded at peak times), then fall back to the Lite model, which is
+  // usually less contended.
+  const attempts = [
+    { model: 'gemini-3.6-flash', delayMs: 0 },
+    { model: 'gemini-3.6-flash', delayMs: 4000 },
+    { model: 'gemini-3.6-flash', delayMs: 9000 },
+    { model: 'gemini-3.6-flash-lite', delayMs: 0 },
+    { model: 'gemini-3.6-flash-lite', delayMs: 5000 }
+  ];
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-    body: JSON.stringify({
-      system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
-      contents: [{ role: 'user', parts }]
-    })
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Gemini API error ${response.status}: ${errText}`);
+  let lastErr;
+  for (let i = 0; i < attempts.length; i++) {
+    const { model, delayMs } = attempts[i];
+    if (delayMs) {
+      setStatus(`Gemini (${model}) is busy — retrying in ${Math.round(delayMs / 1000)}s (attempt ${i + 1}/${attempts.length})...`);
+      await new Promise(r => setTimeout(r, delayMs));
+    } else if (i > 0) {
+      setStatus(`Retrying with ${model} (attempt ${i + 1}/${attempts.length})...`);
+    }
+    try {
+      const textOut = await callGeminiOnce(apiKey, model, SYSTEM_PROMPT, parts);
+      return parseJsonArrayFromText(textOut);
+    } catch (e) {
+      lastErr = e;
+      // Only keep retrying on overload/rate-limit style errors; fail fast on anything else (e.g. bad key).
+      if (![429, 503, 500].includes(e.status)) throw e;
+    }
   }
-  const data = await response.json();
-  const candidate = (data.candidates || [])[0];
-  const textOut = ((candidate && candidate.content && candidate.content.parts) || [])
-    .map(p => p.text || '').join('\n');
-  return parseJsonArrayFromText(textOut);
+  throw lastErr;
 }
 
 async function callProvider(provider, apiKey, text, images) {
