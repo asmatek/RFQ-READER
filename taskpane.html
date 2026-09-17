@@ -38,6 +38,7 @@
       <label>Provider</label>
       <select id="provider">
         <option value="gemini">Google Gemini (free tier)</option>
+        <option value="mistral">Mistral (free, high volume)</option>
         <option value="claude">Anthropic Claude (paid)</option>
       </select>
       <div class="hint" id="providerHint"></div>
@@ -58,6 +59,9 @@
 
   <div class="row" id="downloadRow" style="display:none;">
     <button id="downloadBtn" class="secondary">Download Excel (.xlsx)</button>
+  </div>
+  <div class="row" id="retryRow" style="display:none;">
+    <button id="retryFailedBtn" class="secondary"></button>
   </div>
 
   <div class="wrap">
@@ -87,6 +91,12 @@ const PROVIDER_INFO = {
     hint: 'Free, no credit card needed. Get one at aistudio.google.com/apikey.',
     settingKey: 'geminiApiKey',
     providerHint: 'Free tier (rate-limited, fine for occasional use). Google may use free-tier requests to improve their models.'
+  },
+  mistral: {
+    label: 'Mistral API key',
+    hint: 'Free, no credit card, high volume. Get one at console.mistral.ai (API Keys).',
+    settingKey: 'mistralApiKey',
+    providerHint: 'Free (high daily volume) but requires opting into Mistral using your data to improve their models. Good multilingual translation + vision (Pixtral).'
   },
   claude: {
     label: 'Anthropic API key',
@@ -124,9 +134,61 @@ Office.onReady(() => {
 
   document.getElementById('runBtn').addEventListener('click', runExtraction);
   document.getElementById('downloadBtn').addEventListener('click', downloadExcel);
+  document.getElementById('retryFailedBtn').addEventListener('click', retryFailedBatches);
+
+  offerRestoreIfAvailable();
 });
 
+// ---------- local persistence: survive being interrupted / reopened ----------
+
+function storageKeyForItem() {
+  const item = Office.context.mailbox.item;
+  const id = (item && (item.itemId || item.internetMessageId)) || 'unknown';
+  return 'rfqReaderResults:' + id;
+}
+
+function saveProgress(rows, status) {
+  try {
+    localStorage.setItem(storageKeyForItem(), JSON.stringify({
+      subject: (Office.context.mailbox.item && Office.context.mailbox.item.subject) || '',
+      rows, status, updatedAt: Date.now()
+    }));
+  } catch (e) { /* storage full or unavailable - non-fatal */ }
+}
+
+function offerRestoreIfAvailable() {
+  try {
+    const raw = localStorage.getItem(storageKeyForItem());
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    if (!saved.rows || !saved.rows.length) return;
+    const bar = document.createElement('div');
+    bar.style.cssText = 'background:#eef6ff;border:1px solid #b6d7ff;padding:8px;border-radius:4px;margin-bottom:10px;';
+    const when = new Date(saved.updatedAt).toLocaleString();
+    bar.innerHTML = `Found ${saved.rows.length} previously extracted row(s) for this email (saved ${when}). `;
+    const restoreBtn = document.createElement('button');
+    restoreBtn.textContent = 'Restore';
+    restoreBtn.className = 'secondary';
+    restoreBtn.onclick = () => {
+      lastRows = saved.rows;
+      renderTable(lastRows);
+      setStatus(`Restored ${lastRows.length} row(s) from a previous run (${when}).`);
+      bar.remove();
+    };
+    const dismissBtn = document.createElement('button');
+    dismissBtn.textContent = 'Discard';
+    dismissBtn.className = 'secondary';
+    dismissBtn.onclick = () => { localStorage.removeItem(storageKeyForItem()); bar.remove(); };
+    bar.appendChild(restoreBtn);
+    bar.appendChild(dismissBtn);
+    document.body.insertBefore(bar, document.getElementById('status'));
+  } catch (e) { /* ignore */ }
+}
+
 let lastRows = [];
+let lastBatches = [];              // the batches from the most recent run (for retry)
+let lastBodyText = '';
+let failedBatchIndices = new Set(); // indices into lastBatches that errored last time
 const MAX_IMAGES_PER_BATCH = 8;
 const MAX_IMAGE_DIM = 1600;
 const MAX_DOCS_PER_BATCH = 8;       // how many source files go into one AI call
@@ -495,21 +557,85 @@ async function callGeminiBatch(apiKey, text, images) {
   if (!cachedGeminiModels.length) {
     throw new Error('No usable Gemini Flash models were returned for this API key/account.');
   }
-  const candidates = cachedGeminiModels.slice(0, 3);
-  const attempts = [];
-  candidates.forEach(model => attempts.push({ model, delayMs: 0 }));
-  attempts.push({ model: candidates[0], delayMs: 5000 });
-  attempts.push({ model: candidates[0], delayMs: 9000 });
 
+  let lastErr;
+  const backoffRounds = [0, 5000, 9000]; // ms delay before each full pass over the remaining models
+  for (let round = 0; round < backoffRounds.length; round++) {
+    if (backoffRounds[round]) {
+      setStatus(`Gemini is busy — retrying in ${Math.round(backoffRounds[round] / 1000)}s...`);
+      await new Promise(r => setTimeout(r, backoffRounds[round]));
+    }
+    for (let idx = 0; idx < cachedGeminiModels.length; idx++) {
+      const model = cachedGeminiModels[idx];
+      setStatus(`Trying Gemini model "${model}"...`);
+      try {
+        return await callGeminiOnce(apiKey, model, text, images);
+      } catch (e) {
+        lastErr = e;
+        if (e.status === 404) {
+          // This model is gone for this key/account - drop it permanently for the rest of the run.
+          cachedGeminiModels.splice(idx, 1);
+          idx--;
+          continue;
+        }
+        if ([429, 503, 500].includes(e.status)) {
+          continue; // try the next model in this same pass, no need to wait yet
+        }
+        throw e; // anything else (bad key, etc.) - fail immediately
+      }
+    }
+    if (!cachedGeminiModels.length) break;
+  }
+  throw lastErr;
+}
+
+async function callMistralOnce(apiKey, model, text, images) {
+  const content = [{ type: 'text', text }];
+  images.forEach(img => {
+    content.push({ type: 'text', text: `Image: ${img.name}` });
+    content.push({ type: 'image_url', image_url: `data:${img.mediaType};base64,${img.base64}` });
+  });
+  const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      max_tokens: 8192,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content }
+      ]
+    })
+  });
+  if (!response.ok) {
+    const errText = await response.text();
+    const err = new Error(`Mistral API error ${response.status}: ${errText}`);
+    err.status = response.status;
+    throw err;
+  }
+  const data = await response.json();
+  const msg = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+  const textOut = typeof msg === 'string' ? msg : (Array.isArray(msg) ? msg.map(c => c.text || '').join('\n') : '');
+  return parseJsonArrayFromText(textOut);
+}
+
+async function callMistralBatch(apiKey, text, images) {
+  // Pixtral handles both text and images; fall back to the text-only large model if it 404s for this key.
+  const attempts = [
+    { model: 'pixtral-large-latest', delayMs: 0 },
+    { model: 'pixtral-large-latest', delayMs: 5000 },
+    { model: 'mistral-large-latest', delayMs: 0 },
+    { model: 'pixtral-large-latest', delayMs: 9000 }
+  ];
   let lastErr;
   for (let i = 0; i < attempts.length; i++) {
     const { model, delayMs } = attempts[i];
     if (delayMs) {
-      setStatus(`Gemini is busy — retrying "${model}" in ${Math.round(delayMs / 1000)}s...`);
+      setStatus(`Mistral is busy — retrying "${model}" in ${Math.round(delayMs / 1000)}s...`);
       await new Promise(r => setTimeout(r, delayMs));
     }
     try {
-      return await callGeminiOnce(apiKey, model, text, images);
+      return await callMistralOnce(apiKey, model, text, images);
     } catch (e) {
       lastErr = e;
       if (![404, 429, 503, 500].includes(e.status)) throw e;
@@ -519,7 +645,9 @@ async function callGeminiBatch(apiKey, text, images) {
 }
 
 async function callProviderBatch(provider, apiKey, text, images) {
-  return provider === 'gemini' ? callGeminiBatch(apiKey, text, images) : callClaudeOnce(apiKey, text, images);
+  if (provider === 'gemini') return callGeminiBatch(apiKey, text, images);
+  if (provider === 'mistral') return callMistralBatch(apiKey, text, images);
+  return callClaudeOnce(apiKey, text, images);
 }
 
 // ---------- Step 4: render + export ----------
@@ -561,6 +689,49 @@ function downloadExcel() {
   XLSX.writeFile(wb, `RFQ_${subjectSafe}.xlsx`);
 }
 
+function updateRetryButtonVisibility() {
+  const row = document.getElementById('retryRow');
+  const btn = document.getElementById('retryFailedBtn');
+  if (failedBatchIndices.size > 0) {
+    btn.textContent = `Retry ${failedBatchIndices.size} failed batch(es)`;
+    row.style.display = 'block';
+  } else {
+    row.style.display = 'none';
+  }
+}
+
+function delayBetweenBatches(provider) {
+  if (provider === 'gemini') return GEMINI_BATCH_DELAY_MS;
+  if (provider === 'mistral') return 3000;
+  return 0;
+}
+
+async function runBatchAndRecordResult(provider, apiKey, batchIndex, batch, bodyText, isRetry) {
+  const names = batch.map(s => s.label).join(', ');
+  const label = isRetry ? `Retrying batch ${batchIndex + 1}` : `Batch ${batchIndex + 1}/${lastBatches.length}`;
+  setStatus(`${label}: extracting from ${batch.length} file(s)\n(${names.slice(0, 200)}${names.length > 200 ? '...' : ''})`);
+  const text = buildBatchText(bodyText, batch);
+  const images = buildBatchImages(batch);
+  try {
+    const rows = await callProviderBatch(provider, apiKey, text, images);
+    rows.forEach(r => { r._batchIndex = batchIndex; });
+    lastRows = lastRows.concat(rows);
+    failedBatchIndices.delete(batchIndex);
+    saveProgress(lastRows, `Batch ${batchIndex + 1} succeeded`);
+    return true;
+  } catch (e) {
+    console.error(`Batch ${batchIndex + 1} failed:`, e);
+    lastRows.push({
+      lot_number: '', description: `[Batch ${batchIndex + 1} failed: ${names.slice(0,120)} — ${e.message}]`,
+      part_number: '', quantity: '', budget: '', manufacturer: '', additional_info: '', tender_end_date: '',
+      _batchIndex: batchIndex, _failed: true
+    });
+    failedBatchIndices.add(batchIndex);
+    saveProgress(lastRows, `Batch ${batchIndex + 1} failed`);
+    return false;
+  }
+}
+
 async function runExtraction() {
   const provider = document.getElementById('provider').value;
   const apiKey = document.getElementById('apiKey').value.trim();
@@ -570,45 +741,76 @@ async function runExtraction() {
   }
   cachedGeminiModels = null;
   document.getElementById('runBtn').disabled = true;
+  document.getElementById('retryFailedBtn').disabled = true;
   lastRows = [];
+  failedBatchIndices = new Set();
   renderTable(lastRows);
+  updateRetryButtonVisibility();
   try {
     const { bodyText, segments } = await gatherAllSegments();
-    const batches = buildBatches(segments.length ? segments : [{ label: '(email body only)', text: '', images: [] }]);
-    setStatus(`Found ${segments.length} file(s), split into ${batches.length} batch(es) for processing.`);
-    setProgress(0, batches.length);
+    lastBodyText = bodyText;
+    lastBatches = buildBatches(segments.length ? segments : [{ label: '(email body only)', text: '', images: [] }]);
+    setStatus(`Found ${segments.length} file(s), split into ${lastBatches.length} batch(es) for processing.`);
+    setProgress(0, lastBatches.length);
 
-    for (let i = 0; i < batches.length; i++) {
-      const batch = batches[i];
-      const names = batch.map(s => s.label).join(', ');
-      setStatus(`Batch ${i + 1}/${batches.length}: extracting from ${batch.length} file(s)\n(${names.slice(0, 200)}${names.length > 200 ? '...' : ''})`);
-      const text = buildBatchText(bodyText, batch);
-      const images = buildBatchImages(batch);
-      try {
-        const rows = await callProviderBatch(provider, apiKey, text, images);
-        lastRows = lastRows.concat(rows);
-        renderTable(lastRows);
-      } catch (e) {
-        console.error(`Batch ${i + 1} failed:`, e);
-        lastRows.push({
-          lot_number: '', description: `[Batch ${i + 1} failed: ${names.slice(0,120)} — ${e.message}]`,
-          part_number: '', quantity: '', budget: '', manufacturer: '', additional_info: '', tender_end_date: ''
-        });
-        renderTable(lastRows);
-      }
-      setProgress(i + 1, batches.length);
-      if (provider === 'gemini' && i < batches.length - 1) {
-        await new Promise(r => setTimeout(r, GEMINI_BATCH_DELAY_MS));
+    for (let i = 0; i < lastBatches.length; i++) {
+      await runBatchAndRecordResult(provider, apiKey, i, lastBatches[i], bodyText, false);
+      renderTable(lastRows);
+      updateRetryButtonVisibility();
+      setProgress(i + 1, lastBatches.length);
+      if (i < lastBatches.length - 1) {
+        const delay = delayBetweenBatches(provider);
+        if (delay) await new Promise(r => setTimeout(r, delay));
       }
     }
-    setStatus(`Done. Extracted ${lastRows.length} row(s) from ${segments.length} file(s) across ${batches.length} batch(es).`);
+    const failedNote = failedBatchIndices.size ? ` (${failedBatchIndices.size} batch(es) failed — use "Retry failed batches" below)` : '';
+    setStatus(`Done. Extracted ${lastRows.length} row(s) from ${segments.length} file(s) across ${lastBatches.length} batch(es).${failedNote}`);
+    saveProgress(lastRows, failedBatchIndices.size ? `Complete with ${failedBatchIndices.size} failed batch(es)` : 'Complete');
   } catch (e) {
     setStatus('Error: ' + (e.message || e));
     console.error(e);
   } finally {
     setProgress(0, 0);
     document.getElementById('runBtn').disabled = false;
+    document.getElementById('retryFailedBtn').disabled = false;
   }
+}
+
+async function retryFailedBatches() {
+  const provider = document.getElementById('provider').value;
+  const apiKey = document.getElementById('apiKey').value.trim();
+  if (!apiKey) {
+    setStatus(`Please enter your ${PROVIDER_INFO[provider].label} first.`);
+    return;
+  }
+  if (!failedBatchIndices.size) return;
+
+  document.getElementById('runBtn').disabled = true;
+  document.getElementById('retryFailedBtn').disabled = true;
+  const indicesToRetry = Array.from(failedBatchIndices);
+  setProgress(0, indicesToRetry.length);
+
+  for (let n = 0; n < indicesToRetry.length; n++) {
+    const idx = indicesToRetry[n];
+    // Remove the previous placeholder/error row(s) for this batch before retrying.
+    lastRows = lastRows.filter(r => r._batchIndex !== idx);
+    await runBatchAndRecordResult(provider, apiKey, idx, lastBatches[idx], lastBodyText, true);
+    renderTable(lastRows);
+    updateRetryButtonVisibility();
+    setProgress(n + 1, indicesToRetry.length);
+    if (n < indicesToRetry.length - 1) {
+      const delay = delayBetweenBatches(provider);
+      if (delay) await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  const stillFailed = failedBatchIndices.size;
+  setStatus(stillFailed
+    ? `Retry finished. ${stillFailed} batch(es) still failing — you can retry again.`
+    : `Retry finished. All batches succeeded. ${lastRows.length} row(s) total.`);
+  saveProgress(lastRows, stillFailed ? `${stillFailed} batch(es) still failing` : 'Complete');
+  setProgress(0, 0);
+  document.getElementById('runBtn').disabled = false;
+  document.getElementById('retryFailedBtn').disabled = false;
 }
 </script>
 </body>
