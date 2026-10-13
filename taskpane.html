@@ -432,21 +432,24 @@ function buildBatches(segments) {
 
 // ---------- Step 3: send each batch to the chosen AI provider ----------
 
-const SYSTEM_PROMPT = `You extract structured data from procurement / RFQ / tender documents (often in Russian or Kazakh) and translate everything into clear English.
+const SYSTEM_PROMPT = `You extract structured data from procurement / RFQ / tender / request-for-quotation documents and translate everything into clear English. These documents come in many different layouts and languages (Russian, Kazakh, English, German, and others) and from many different organizations and portals - do not assume a fixed template. Identify the equivalent concept under each layout's own labels, for example:
+- A lot/line item may be labeled "ЛОТ №", "Lot", "Item", "PR No.", "Line", "Position", or just a row number in a table.
+- A deadline may be a single tender-wide "submission deadline" / "окончание приема заявок", OR a per-line "Delivery date" / "required by" - if there is no single tender-wide deadline, use the most relevant date mentioned for that line (e.g. its required delivery date) and say what kind of date it is in additional_info.
+- Budget/price may be a planned sum, a unit price, "GRAND TOTAL", or simply blank fields the supplier is meant to fill in - if no price is given at all (the document is asking the supplier to quote one), leave budget empty rather than guessing.
 
 You will receive the email text plus one or more source documents (each clearly marked with "=== FILE: name ===") - these may be PDFs, Word docs, spreadsheets, or images (photos of nameplates, scanned pages, technical drawings). Read any text visible in images too (part numbers, model/serial numbers, manufacturer names, ratings) and use it to fill in or corroborate the fields below. You may only be seeing a subset of a larger tender's files in this particular request - that's fine, just extract everything present here.
 
 Return a JSON array. Each element represents one lot/line item and must have exactly these fields:
-- "lot_number": the lot or line number (and purchase/tender number if shown alongside it)
-- "description": a concise English description of the item/goods/works/services (translate from Russian/Kazakh)
-- "part_number": manufacturer part number / drawing number if present, else ""
-- "quantity": quantity and unit (e.g. "5 pcs"), else ""
-- "budget": the budgeted/planned amount and currency for that lot, else ""
+- "lot_number": the lot/line/item/PR number (and overall tender or RFQ number if shown alongside it)
+- "description": a concise English description of the item/goods/works/services (translate as needed)
+- "part_number": manufacturer part number / drawing number / model number if present, else ""
+- "quantity": quantity and unit (e.g. "5 pcs", "2 EA"), else ""
+- "budget": the planned/budgeted amount and currency for that line if stated, else ""
 - "manufacturer": manufacturer/brand/model if mentioned, else ""
-- "additional_info": delivery location, payment terms, delivery timeframe, or any other notable requirement, in English, else ""
-- "tender_end_date": the deadline for submitting bids/quotes (date and time if available), else ""
+- "additional_info": delivery location, payment terms, delivery timeframe, certification/documentation requirements, material numbers, or any other notable requirement, in English, else ""
+- "tender_end_date": the deadline relevant to that line - a bid-submission deadline if the document has one, otherwise a stated delivery/required-by date - note in additional_info which kind of date it is if it isn't an explicit submission deadline; else ""
 
-If a source document covers multiple lots, return one row per lot. If a document is a single item's spec, return a single row for it. Respond with ONLY the JSON array, no markdown fences, no commentary.`;
+If a source document covers multiple lots/lines, return one row per lot/line. If a document is a single item's spec, return a single row for it. Respond with ONLY the JSON array, no markdown fences, no commentary.`;
 
 function parseJsonArrayFromText(raw) {
   const cleaned = raw.replace(/```json|```/g, '').trim();
